@@ -1,0 +1,61 @@
+# Rapport scan emails — 2026-08-17T11:00
+Mode : LIVE
+📧 Scan emails (live) : 1 classés, 0 spam/faible valeur, 0 brouillons à valider, 0 envoyés auto.
+
+- [orange] 'Bacrot et Milliet vainqueurs des Nationaux' (de contact@echecs-et-strategie.com) → classé via règle → À trier
+# Rapport scan emails — 2026-08-17T19:00
+Mode : LIVE
+📧 Scan emails (live) : 4 classés, 0 spam/faible valeur, 1 brouillons à valider, 0 envoyés auto.
+
+- [orange] 'Votre colis DHL EXPRESS est arrivé' (de noreply@relaiscolis.com) → classé via groq → À trier
+- [orange] 'DHL On Demand Delivery' (de noreply.odd@dhl.com) → classé via groq → À trier
+- [orange] 'Votre rendez-vous du lundi 24 août 2026 à 14h00' (de no-reply@doctolib.fr) → classé via groq → Ameli - Santé/Médecin + brouillon créé (à valider)
+- [orange] 'DHL On Demand Delivery' (de noreply.odd@dhl.com) → classé via groq → À trier
+# Rapport scan emails — 2026-08-18T11:00
+Mode : LIVE
+📧 Scan emails (live) : 6 classés, 0 spam/faible valeur, 0 brouillons à valider, 0 envoyés auto.
+
+- [orange] 'Je vous ai envoyé une demande de connexion' (de invitations@linkedin.com) → classé via règle → À trier
+- [orange] 'Je vous ai envoyé une demande de connexion' (de invitations@linkedin.com) → classé via règle → À trier
+- [orange] 'Jean-François, répondez à l’offre d’emploi de Responsable Production (h/f) chez LHH et plus encore' (de jobs-noreply@linkedin.com) → classé via règle → À trier
+- [orange] 'Profite de -80\xa0% sur Super\xa0Famille\xa0!' (de no-reply@duolingo.com) → classé via règle → À trier
+- [orange] 'Vos 3 exercices du jour' (de contact@echecs-et-strategie.com) → classé via règle → À trier
+- [orange] '10\u202f% de réduction supplémentaire pour votre rentrée | PRÉPAREZ-VOUS POUR LA RENTRÉE' (de dell_technologies@comms.dell.com) → classé via groq → À trier
+# Rapport scan emails — 2026-08-18T19:00
+Mode : LIVE
+📧 Scan emails (live) : 5 classés, 0 spam/faible valeur, 0 brouillons à valider, 0 envoyés auto.
+
+- [orange] 'Jean-François, vos posts ont obtenu 17\xa0impressions la semaine dernière' (de notifications-noreply@linkedin.com) → classé via règle → À trier
+- [orange] 'Jon vient de vous envoyer un message' (de messaging-digest-noreply@linkedin.com) → classé via règle → À trier
+- [orange] 'Je vous ai envoyé une demande de connexion' (de invitations@linkedin.com) → classé via règle → À trier
+- [orange] 'Ne manquez pas les discussions dans systems thinking network' (de groups-noreply@linkedin.com) → classé via règle → À trier
+- [orange] 'James vient de vous envoyer un message' (de messaging-digest-noreply@linkedin.com) → classé via règle → À trier
+# Rapport scan emails — 2026-08-19T03:00
+Mode : LIVE
+📧 Scan emails (live) : 1 classés, 0 spam/faible valeur, 0 brouillons à valider, 0 envoyés auto.
+
+- [outlook] 'Déployez des machines virtuelles pour tout type de cas dans Azure' (de azure@promomail.microsoft.com) → classé via règle → Microsoft
+# Rapport scan emails — 2026-08-19T11:00
+Mode : LIVE
+📧 Scan emails (live) :
+• Gmail : 0 classé(s) (dont 0 à trier), 0 brouillon(s) à valider
+• Outlook : 0 classé(s) (dont 0 à trier), 0 brouillon(s) à valider
+• Orange : 1 classé(s) (dont 1 à trier), 0 brouillon(s) à valider
+
+- [orange] 'La formule gagnante échecs et esport' (de contact@echecs-et-strategie.com) → classé via règle → À trier
+# Rapport scan emails — 2026-08-19T19:00
+Mode : LIVE
+📧 Scan emails (live) :
+• Gmail : 0 classé(s) (dont 0 à trier), 0 brouillon(s) à valider
+• Outlook : 0 classé(s) (dont 0 à trier), 0 brouillon(s) à valider
+• Orange : 9 classé(s) (dont 4 à trier), 0 brouillon(s) à valider
+
+- [orange] 'Incendies : collecte en faveur des professionnels sinistrés \u200b👐\u200b' (de newsletter@emailing.pagesjaunes.fr) → classé via groq → À trier
+- [orange] 'Tarification - randonnée équestre en forêt de Rambouillet le 4 octobre' (de thierry.danos@yahoo.fr) → classé via règle → IAE Caen Alumni
+- [orange] 'CENTURION SEARCH | Cabinet de recrutement recrute au poste de Production industrielle' (de jobs-noreply@linkedin.com) → classé via règle → À trier
+- [orange] 'La défense Est-Indienne par Laurent Fressinet' (de contact@echecs-et-strategie.com) → classé via règle → À trier
+- [orange] ' RE: Tarification - randonnée équestre en forêt de Rambouillet le 4 octobre' (de b.lemarchand@deauville.fr) → classé via règle → IAE Caen Alumni
+- [orange] 'Re: Tarification - randonnée équestre en forêt de Rambouillet le 4 octobre' (de thierry.danos@yahoo.fr) → classé via règle → IAE Caen Alumni
+- [orange] ' Re: Tarification - randonnée équestre en forêt de Rambouillet le 4 octobre' (de marylene.follain@hotmail.fr) → classé via règle → IAE Caen Alumni
+- [orange] 'Il est encore temps de nous raconter votre expérience avec la FNAC' (de satisfaction@client.fnac.com) → classé via règle → Fnac
+- [orange] 'The tradeoff you see might not be real' (de katie@kbjanderson.com) → classé via groq → À trier
