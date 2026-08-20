@@ -553,8 +553,8 @@ class GraphAccount:
             h.update(extra)
         return h
 
-    def _get(self, path: str, params: dict = None) -> dict:
-        r = requests.get(f"{GRAPH_BASE}{path}", headers=self._headers(), params=params, timeout=30)
+    def _get(self, path: str, params: dict = None, extra_headers: dict = None) -> dict:
+        r = requests.get(f"{GRAPH_BASE}{path}", headers=self._headers(extra_headers), params=params, timeout=30)
         r.raise_for_status()
         return r.json()
 
@@ -571,10 +571,17 @@ class GraphAccount:
         return r.json() if r.text else {}
 
     def fetch_unseen(self, folder: str = "inbox") -> list:
+        # "body" (au lieu du seul "bodyPreview", tronqué à ~255 caractères par
+        # Graph) + l'en-tête Prefer ci-dessous (texte brut plutôt que HTML) :
+        # nécessaire pour repérer les en-têtes de transfert ("De :", "From:")
+        # dans les emails que l'utilisateur se transfère lui-même — le
+        # bodyPreview était trop court pour contenir l'expéditeur d'origine
+        # (cf. cas LEGO du 20/08, classé à tort en "À trier").
         data = self._get(
             f"/me/mailFolders/{folder}/messages",
             params={"$filter": "isRead eq false", "$top": 50,
-                    "$select": "id,subject,from,receivedDateTime,bodyPreview,internetMessageId"},
+                    "$select": "id,subject,from,receivedDateTime,body,internetMessageId"},
+            extra_headers={"Prefer": 'outlook.body-content-type="text"'},
         )
         return data.get("value", [])
 
@@ -696,13 +703,14 @@ def normalize_imap(uid: str, msg: Message, raw_bytes: bytes) -> dict:
 
 def normalize_graph(m: dict) -> dict:
     sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "").lower()
+    body_text = (m.get("body") or {}).get("content", "") or m.get("bodyPreview") or ""
     return {
         "backend_id": m["id"],
         "message_id": m.get("internetMessageId") or f"graph:{m['id']}",
         "sender": sender,
         "subject": m.get("subject") or "(sans objet)",
         "date": m.get("receivedDateTime", ""),
-        "body_excerpt": " ".join((m.get("bodyPreview") or "")[:800].split()),
+        "body_excerpt": " ".join(body_text[:1500].split()),
         "raw": None,
     }
 
@@ -721,6 +729,25 @@ def match_rule(sender_email: str, rules: list):
         if mtype == "sender" and sender_email == match:
             return rule
     return None
+
+# Repère un en-tête de transfert ("De :", "From:", "Expéditeur :" — Outlook,
+# Gmail et la plupart des clients mobiles citent ces en-têtes en début de
+# corps lors d'un transfert) et en extrait l'adresse email d'origine. Sert
+# uniquement quand l'expéditeur apparent (From) est l'une des 3 boîtes
+# elles-mêmes : un mail que l'utilisateur se transfère à lui-même ne doit
+# pas être classé/jugé d'après SA propre adresse, mais d'après l'expéditeur
+# réel du message d'origine (ex. transfert d'une facture LEGO depuis Orange
+# vers Outlook — cas réel du 20/08/2026, resté en "À trier" faute de ça).
+_FORWARD_HEADER_RE = re.compile(
+    r'(?:De|From|Exp[ée]diteur)\s*:\s*[^\n]{0,60}?([\w.+\-]+@[\w\-]+\.[\w.\-]+)',
+    re.IGNORECASE,
+)
+
+def extract_forwarded_sender(body_excerpt: str):
+    if not body_excerpt:
+        return None
+    m = _FORWARD_HEADER_RE.search(body_excerpt)
+    return m.group(1).lower() if m else None
 
 # ══════════════════════════════════════════════════════════════════════════
 #  GROQ — CLASSIFICATION & RÉDACTION
@@ -843,7 +870,8 @@ def send_telegram(token: str, chat_id: str, text: str):
 def process_account(account_name: str, messages: list, cfg: dict, rules: list, taxonomy: set,
                      groq_client: OpenAI, history: History, dry_run: bool,
                      stats: dict, report_lines: list, events_log: Path,
-                     outlook: GraphAccount, gmail: ImapAccount = None, orange: ImapAccount = None):
+                     outlook: GraphAccount, gmail: ImapAccount = None, orange: ImapAccount = None,
+                     self_addresses: set = frozenset()):
     model_classif = cfg["groq"]["model_classification"]
     model_reply = cfg["groq"]["model_reply"]
     auto_send_types = set(cfg.get("autonomy", {}).get("auto_send_types", []))
@@ -858,7 +886,20 @@ def process_account(account_name: str, messages: list, cfg: dict, rules: list, t
         sender, subject, date_hdr, body_excerpt = msg["sender"], msg["subject"], msg["date"], msg["body_excerpt"]
 
         try:
+            # Auto-transfert détecté (l'utilisateur s'envoie un mail à
+            # lui-même d'une boîte à l'autre) : sender ne dit rien de
+            # l'origine réelle du message — on tente d'extraire l'expéditeur
+            # d'origine depuis l'en-tête de transfert cité dans le corps.
+            forwarded_sender = extract_forwarded_sender(body_excerpt) \
+                if sender in self_addresses else None
+            forward_note = ""
+
             rule = match_rule(sender, rules)
+            if not rule and forwarded_sender and forwarded_sender not in self_addresses:
+                rule = match_rule(forwarded_sender, rules)
+                if rule:
+                    forward_note = f"(transfert détecté, expéditeur d'origine : {forwarded_sender}) "
+
             if rule:
                 classification = {
                     "folder": rule.get("folder"),
@@ -868,8 +909,22 @@ def process_account(account_name: str, messages: list, cfg: dict, rules: list, t
                 }
                 source = "règle"
             else:
+                # Si c'est un transfert, on donne à Groq l'expéditeur
+                # d'origine trouvé (ou, à défaut, on le prévient explicitement
+                # que 'sender' est l'utilisateur lui-même) pour qu'il ne se
+                # base pas à tort sur sa propre adresse.
+                groq_sender = sender
+                if sender in self_addresses:
+                    groq_sender = (
+                        f"{sender} (ceci est un TRANSFERT fait par l'utilisateur lui-même — "
+                        f"expéditeur d'origine probable : {forwarded_sender}, ignore l'adresse "
+                        f"ci-dessus et classe d'après cet expéditeur et le sujet/contenu)"
+                        if forwarded_sender else
+                        f"{sender} (ceci est un TRANSFERT fait par l'utilisateur lui-même — "
+                        f"expéditeur d'origine inconnu, classe uniquement d'après le sujet et le contenu)"
+                    )
                 classification = classify_with_groq(groq_client, model_classif, taxonomy,
-                                                      sender, subject, date_hdr, body_excerpt)
+                                                      groq_sender, subject, date_hdr, body_excerpt)
                 source = "groq"
                 # Groq peut halluciner une variante proche d'un chemin réel 
                 # Donc, on rejette tout chemin qui ne correspond pas
@@ -889,11 +944,16 @@ def process_account(account_name: str, messages: list, cfg: dict, rules: list, t
             reply_type = classification.get("reply_type")
             action_desc = ""
 
-            # Suppression automatique retirée car le jugement "spam" de Groq
-            # n'est pas assez fiable pour une suppression irréversible sans
-            # supervision. Un présumé spam part désormais dans "À trier"
-            # pour relecture manuelle, sur tous les comptes.
-            if is_spam and never_auto_delete:
+            # Suppression automatique retirée pour le jugement "spam" de Groq
+            # (heuristique, pas assez fiable pour une suppression sans
+            # supervision — cf. faux positifs LEGO/Microsoft du 16/08). Un
+            # présumé spam par Groq part donc toujours dans "À trier".
+            # En revanche une règle explicite (action: spam/low_value dans
+            # rules_*.yaml) est déterministe et écrite par l'utilisateur —
+            # elle n'est PAS concernée par ce garde-fou et peut supprimer
+            # (déplacement en corbeille, jamais de purge définitive — voir
+            # plus bas). never_auto_delete ne s'applique donc qu'à source == "groq".
+            if is_spam and never_auto_delete and source == "groq":
                 is_spam = False
                 folder = "À trier"
                 classification["summary"] = f"(présumé spam par {source} — laissé pour relecture) " \
@@ -908,7 +968,7 @@ def process_account(account_name: str, messages: list, cfg: dict, rules: list, t
             # IMPORTANT : cette vérification est en LECTURE SEULE (aucune mutation), 
             # donc volontairement PAS conditionnée par dry_run —
             # sinon le dry-run ne teste jamais rien de réel sur ce point et donne une fausse confiance.
-            action_desc_prefix = ""
+            action_desc_prefix = forward_note
             if folder != "À trier" and not is_spam:
                 if account_name == "orange":
                     if orange.resolve_folder_path(folder) is None:
@@ -919,12 +979,40 @@ def process_account(account_name: str, messages: list, cfg: dict, rules: list, t
                     folder = "À trier"
 
             if is_spam:
-                action_desc = f"supprimé via {source} (spam/faible valeur)"
+                action_desc = f"{forward_note}supprimé via {source} (règle low_value/spam) → Corbeille"
                 stats[account_name]["spam"] += 1
                 if not dry_run:
                     if account_name == "gmail":
-                        gmail.delete_uid(msg["backend_id"], message_id_header=message_id)
+                        # Pas de message_id_header ici : on veut un déplacement
+                        # vers "[Gmail]/Trash" simple et récupérable, PAS la purge
+                        # définitive (celle-ci est réservée au workflow de
+                        # transfert Gmail→Outlook, où le contenu est de toute
+                        # façon déjà en sécurité côté Outlook).
+                        gmail.delete_uid(msg["backend_id"])
+                    elif account_name == "orange":
+                        # Orange n'a pas d'équivalent de outlook.delete_message :
+                        # déplacement natif IMAP vers le dossier système marqué
+                        # \Trash (jamais deviné par son nom affiché), trouvé une
+                        # fois au démarrage — voir orange.trash_folder plus bas.
+                        if orange.trash_folder:
+                            orange.move_uid_to_folder(msg["backend_id"], orange.trash_folder)
+                        else:
+                            # Filet de sécurité : pas de dossier \Trash détecté
+                            # sur le serveur → on ne supprime rien plutôt que de
+                            # risquer une perte, repli sur "À trier" (déplacement
+                            # réel, pas juste un changement d'étiquette dans le rapport).
+                            is_spam = False
+                            folder = "À trier"
+                            target = orange.resolve_folder_path(folder, create_if_missing=True)
+                            orange.move_uid_to_folder(msg["backend_id"], target)
+                            action_desc = "(dossier Corbeille introuvable sur Orange, repli) " \
+                                          f"classé via {source} → À trier"
+                            stats[account_name]["spam"] -= 1
+                            stats[account_name]["classified"] += 1
+                            stats[account_name]["a_trier"] += 1
                     else:
+                        # Outlook : déplacement vers Éléments supprimés,
+                        # récupérable (confirmé en test réel le 16/08).
                         outlook.delete_message(msg["backend_id"])
             else:
                 action_desc = f"{action_desc_prefix}classé via {source} → {folder}"
@@ -1038,6 +1126,12 @@ def main():
     orange_cfg = cfg["imap"]["orange"]
     graph_cfg = cfg["graph"]
 
+    # Les 3 adresses de l'utilisateur lui-même : sert à détecter les
+    # auto-transferts (voir extract_forwarded_sender) — un mail que
+    # l'utilisateur s'envoie d'une boîte à l'autre ne doit pas être classé
+    # d'après SA propre adresse.
+    self_addresses = {gmail_cfg["user"].lower(), orange_cfg["user"].lower(), graph_cfg["user"].lower()}
+
     gmail = ImapAccount("gmail", gmail_cfg["host"], gmail_cfg["port"],
                         gmail_cfg["user"], os.environ["GMAIL_APP_PW"])
     orange = ImapAccount("orange", orange_cfg["host"], orange_cfg["port"],
@@ -1057,18 +1151,24 @@ def main():
         outlook.resolve_folder_id("À trier", create_if_missing=True)
         orange.resolve_folder_path("À trier", create_if_missing=True)
         orange.drafts_folder = orange.find_special_folder("\\Drafts")
+        # Trouvé une fois au démarrage, comme drafts_folder : sert au
+        # déplacement (récupérable) des messages matchant une règle
+        # explicite low_value/spam dans rules_orange.yaml.
+        orange.trash_folder = orange.find_special_folder("\\Trash")
 
         outlook_raw = outlook.fetch_unseen()
         gmail_raw = gmail.fetch_unseen(since_days=since_days)
         orange_raw = orange.fetch_unseen()
 
         process_account("outlook", [normalize_graph(m) for m in outlook_raw], cfg, rules, taxonomy,
-                         groq_client, history, dry_run, stats, report_lines, events_log, outlook)
+                         groq_client, history, dry_run, stats, report_lines, events_log, outlook,
+                         self_addresses=self_addresses)
         process_account("gmail", [normalize_imap(uid, m, raw) for uid, m, raw in gmail_raw], cfg, rules, taxonomy,
-                         groq_client, history, dry_run, stats, report_lines, events_log, outlook, gmail=gmail)
+                         groq_client, history, dry_run, stats, report_lines, events_log, outlook, gmail=gmail,
+                         self_addresses=self_addresses)
         process_account("orange", [normalize_imap(uid, m, raw) for uid, m, raw in orange_raw], cfg, rules_orange,
                          taxonomy_orange, groq_client, history, dry_run, stats, report_lines, events_log,
-                         outlook, orange=orange)
+                         outlook, orange=orange, self_addresses=self_addresses)
 
         history.save()
 
