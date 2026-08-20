@@ -61,11 +61,11 @@ rules:
     match: "sanef.com"
     folder: "JFB Conseils/Déplacements/Sanef"
 
-  - match_type: domain
+  - match_type: domain_suffix
     match: "lego.com"
     folder: "JFB Conseils/Livres Jeux/Lego"
 
-  - match_type: domain
+  - match_type: domain_suffix
     match: "tiime.fr"
     folder: "JFB Conseils/Tiime"
 
