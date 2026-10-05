@@ -3,13 +3,15 @@
 Script autonome de scan, classification et réponse pour les 3 boîtes email de **JFBConseils**, exécuté sur un Raspberry Pi 5.
 
 ## Boîtes gérées
-| Boîte                            | Protocole                             | Comportement                                                                                   |
-|---                               |---                                    |---                                                                                             |
-| `jfbconseil14@gmail.com`         | IMAP + mot de passe d'application     | Classée puis **transférée vers Outlook et vidée** (Gmail ne conserve aucun message après scan) |
-| `jeanfrancois.brunet@outlook.fr` | Microsoft Graph (OAuth2, device code) | Boîte pivot — classement dans son arborescence de dossiers                                     |
+| Boîte                            | Protocole                             | Comportement                                                                                                                |
+|---                               |---                                    |---                                                                                                                          |
+| `jfbconseil14@gmail.com`         | IMAP + mot de passe d'application     | Classée puis **transférée vers Outlook et vidée** (Gmail ne conserve aucun message après scan)                              |
+| `jeanfrancois.brunet@outlook.fr` | Microsoft Graph (OAuth2, device code) | Boîte pivot — classement dans son arborescence de dossiers                                                                  |
 | `jeanfrancois-brunet@orange.fr`  | IMAP + mot de passe dédié             | Classée **sur place**, jamais vidée, arborescence de dossiers distincte (sauf exceptions `transfer_outlook`, voir plus bas) |
 
 Gmail et Orange utilisent tous deux l'authentification IMAP classique. Outlook n'accepte plus les mots de passe d'application depuis que Microsoft a coupé l'authentification basique sur les comptes personnels (septembre 2024) : ce compte passe donc par l'API Microsoft Graph en OAuth2.
+
+Sur Gmail, un filtre dédié (`De : seloger` → libellé **Immo**, ignorer la boîte de réception) détourne les alertes immobilières avant qu'elles n'atteignent la boîte de réception : `emails_scan.py` ne les voit donc jamais et ne les transfère/vide pas. Elles sont lues séparément par le projet `recherche_immobilier.py` (voir « Projets associés » plus bas).
 
 ## Fonctionnement
 1. Récupération des messages non lus de chaque boîte.
@@ -81,5 +83,10 @@ events.log                   erreurs et incidents
 ## Notification Telegram
 Un résumé est envoyé après chaque run, détaillant pour chaque boîte le nombre de messages classés, dont ceux laissés en "À trier", et le nombre de brouillons de réponse en attente de validation. Le rapport complet, message par message, reste consultable dans `workspace/last_report.md`.
 
+Le bot et le fichier de configuration (`~/.telegram_config`, section `[telegram]`, clés `token_groq`/`chat_id`) sont partagés avec d'autres scripts du Raspberry Pi (ex. `recherche_immobilier.py`) : un seul bot/jeton à gérer, chaque script envoyant ses propres messages de façon indépendante.
+
+## Projets associés
+- **`recherche_immobilier.py`** — suivi des annonces immobilières (achat/location) à L'Aigle, via les alertes e-mail SeLoger lues dans le libellé Gmail **Immo** (voir ci-dessus). Projet distinct, mais qui réutilise volontairement les mêmes conventions que celui-ci : mot de passe d'application Gmail commun (`GMAIL_APP_PW`, dans le même `.secrets.env`), et même bot Telegram (`~/.telegram_config`). Aucune modification d'`emails_scan.py` n'est nécessaire pour cette coexistence.
+
 ## Auteur
-Jean-François Brunet – JFBConseils - Sept 2026
+Jean-François Brunet – JFBConseils - Octobre 2026
