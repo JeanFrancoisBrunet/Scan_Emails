@@ -34,3 +34,7 @@ history.json.lock
 .msal_token_cache.json
 .secrets.env
 *.log
+config.yaml
+history*.json
+workspace/
+old/rules_orange.yaml
