@@ -28,3 +28,9 @@ history.json.lock
 Recherche_immo/*.log
 Scan_emails/*.log
 Timekeeping/*.log
+
+history.json
+history.json.lock
+.msal_token_cache.json
+.secrets.env
+*.log
