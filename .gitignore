@@ -38,3 +38,4 @@ config.yaml
 history*.json
 workspace/
 old/rules_orange.yaml
+rules_*.yaml
