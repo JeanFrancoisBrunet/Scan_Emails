@@ -22,6 +22,16 @@
 #  Orange classé. Les réponses sont des brouillons à valider, sauf types très cadrés listés dans
 #  autonomy.auto_send_types (config.yaml) qui peuvent partir automatiquement.
 #
+#  RÈGLES À CONDITION DE CONTENU —
+#  Une règle (rules_*.yaml) peut porter en plus la clé optionnelle "body_contains"
+#  (une chaîne, ou une liste de chaînes dont UNE SEULE suffit). La règle ne
+#  s'applique alors que si l'expéditeur correspond ET que le sujet ou le corps du
+#  message contient ce texte (insensible à la casse, espaces ignorés). Utile quand un
+#  même expéditeur doit être classé selon une référence figurant dans le message
+#  (numéro de client, de contrat, de dossier...). Valable pour les 3 boîtes. La
+#  première règle qui correspond l'emporte : placer les règles à condition de
+#  contenu AVANT la règle générale du même expéditeur.
+#
 #  Usage :
 #    python3 emails_scan.py                           # dry-run (par défaut)
 #    python3 emails_scan.py --live                    # actions réelles
@@ -47,10 +57,11 @@
 #    workspace/last_report.md                              dernier rapport détaillé (par boîte)
 #    events.log                                            erreurs et incidents
 #
-#  Auteur : Jean-François BRUNET – JFBConseils - Aout 2026
+#  Auteur : Jean-François BRUNET – JFBConseils - Aout 2026 (mis à jour Novembre 2026)
 # =============================================================================
 
 import os
+import html
 import sys
 import re
 import json
@@ -307,6 +318,40 @@ def get_body_excerpt(msg: Message, max_chars: int = 800) -> str:
         except Exception:
             body = ""
     return " ".join(body.split())[:max_chars]
+
+_HTML_BLOCK_RE = re.compile(r"(?is)<(script|style|head)\b.*?</\1\s*>")
+_HTML_TAG_RE = re.compile(r"(?s)<[^>]*>")
+
+def html_to_text(raw_html: str) -> str:
+    """Convertit du HTML en texte brut (retire scripts, styles et balises,
+    décode les entités). Simple et tolérant : sert uniquement à rechercher
+    un texte dans un message, pas à l'afficher."""
+    text = _HTML_BLOCK_RE.sub(" ", raw_html)
+    text = _HTML_TAG_RE.sub(" ", text)
+    return html.unescape(text)
+
+def get_match_text(msg: Message, max_chars: int = 30000) -> str:
+    """Texte complet du message (toutes les parties texte, brut ET HTML),
+    destiné UNIQUEMENT à la recherche de condition de contenu dans les
+    règles (clé "body_contains"). Distinct de get_body_excerpt, volontairement
+    court et limité au texte brut, qui sert à la classification Groq : un
+    message peut n'exister qu'en HTML, et l'information cherchée peut se
+    trouver au-delà de l'extrait."""
+    chunks = []
+    for part in msg.walk():
+        ctype = part.get_content_type()
+        disp = str(part.get("Content-Disposition") or "")
+        if ctype not in ("text/plain", "text/html") or "attachment" in disp:
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                continue
+            text = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+        except Exception:
+            continue
+        chunks.append(html_to_text(text) if ctype == "text/html" else text)
+    return " ".join(" ".join(chunks).split())[:max_chars]
 
 # ══════════════════════════════════════════════════════════════════════════
 #  BACKEND GMAIL — IMAP classique
@@ -783,7 +828,9 @@ def normalize_imap(uid: str, msg: Message, raw_bytes: bytes) -> dict:
         "subject": decode_str(msg.get("Subject", "(sans objet)")),
         "date": msg.get("Date", ""),
         "body_excerpt": get_body_excerpt(msg),
-        "raw": msg,                # message parsé (extraction sujet/corps uniquement)
+        # Sujet + corps complet, pour les règles à condition de contenu (body_contains)
+        "match_text": decode_str(msg.get("Subject", "")) + " " + get_match_text(msg),
+        "raw": msg,             # message parsé (extraction sujet/corps uniquement)
         "raw_bytes": raw_bytes,    # octets EXACTS d'origine — utilisés pour l'import Outlook,
                                    # jamais msg.as_bytes() (recodage risqué, cause du bug quoted-printable)
     }
@@ -798,6 +845,8 @@ def normalize_graph(m: dict) -> dict:
         "subject": m.get("subject") or "(sans objet)",
         "date": m.get("receivedDateTime", ""),
         "body_excerpt": " ".join(body_text[:1500].split()),
+        # Sujet + corps complet, pour les règles à condition de contenu (body_contains)
+        "match_text": (m.get("subject") or "") + " " + " ".join(body_text[:30000].split()),
         "raw": None,
     }
 
@@ -805,15 +854,37 @@ def normalize_graph(m: dict) -> dict:
 #  RÈGLES DE PRÉ-CLASSIFICATION
 # ══════════════════════════════════════════════════════════════════════════
 
-def match_rule(sender_email: str, rules: list):
+def _content_matches(rule: dict, match_text: str) -> bool:
+    """Condition de contenu optionnelle d'une règle ("body_contains" : une
+    chaîne ou une liste, une seule suffit). Sans cette clé, la règle ne pose
+    aucune condition de contenu (comportement historique inchangé). La
+    comparaison ignore la casse et les espaces, pour tolérer une référence
+    écrite avec des espaces ou coupée par une mise en page."""
+    needles = rule.get("body_contains")
+    if not needles:
+        return True
+    if isinstance(needles, str):
+        needles = [needles]
+    haystack = (match_text or "").casefold()
+    haystack_compact = "".join(haystack.split())
+    for needle in needles:
+        n = str(needle).casefold().strip()
+        if not n:
+            continue
+        if n in haystack or "".join(n.split()) in haystack_compact:
+            return True
+    return False
+
+def match_rule(sender_email: str, rules: list, match_text: str = ""):
     domain = sender_email.split("@")[-1] if "@" in sender_email else ""
     for rule in rules:
         mtype, match = rule.get("match_type"), (rule.get("match") or "").lower()
-        if mtype == "domain" and domain == match:
-            return rule
-        if mtype == "domain_suffix" and (domain == match or domain.endswith("." + match)):
-            return rule
-        if mtype == "sender" and sender_email == match:
+        sender_ok = (
+            (mtype == "domain" and domain == match)
+            or (mtype == "domain_suffix" and (domain == match or domain.endswith("." + match)))
+            or (mtype == "sender" and sender_email == match)
+        )
+        if sender_ok and _content_matches(rule, match_text):
             return rule
     return None
 
@@ -983,9 +1054,10 @@ def process_account(account_name: str, messages: list, cfg: dict, rules: list, t
             reply_target_sender = forwarded_sender if (is_self_forward and forwarded_sender) else sender
             reply_to_override = forwarded_sender if (is_self_forward and forwarded_sender) else None
 
-            rule = match_rule(sender, rules)
+            match_text = msg.get("match_text", "")
+            rule = match_rule(sender, rules, match_text)
             if not rule and forwarded_sender and forwarded_sender not in self_addresses:
-                rule = match_rule(forwarded_sender, rules)
+                rule = match_rule(forwarded_sender, rules, match_text)
                 if rule:
                     forward_note = f"(transfert détecté, expéditeur d'origine : {forwarded_sender}) "
 
@@ -999,10 +1071,14 @@ def process_account(account_name: str, messages: list, cfg: dict, rules: list, t
                 classification = {
                     "folder": rule.get("folder"),
                     "is_spam": rule.get("action") in ("spam", "low_value"),
-                    "priority": "normale", "summary": f"(classé par règle : {rule.get('match')})",
+                    "priority": "normale", "summary": f"(classé par règle : {rule.get('match')}"
+                               f"{' + contenu' if rule.get('body_contains') else ''})",
                     "action_items": [], "needs_reply": False, "reply_type": None,
                 }
-                source = "règle"
+                # "règle + contenu" quand la règle comporte une condition body_contains :
+                # visible dans le rapport (action_desc), pour pouvoir vérifier qu'une
+                # classification vient bien de la référence cherchée dans le message.
+                source = "règle + contenu" if rule.get("body_contains") else "règle"
             else:
                 # Si c'est un transfert, on donne à Groq l'expéditeur d'origine trouvé 
                 # (ou, à défaut, on le prévient explicitement que 'sender' est l'utilisateur lui-même) 

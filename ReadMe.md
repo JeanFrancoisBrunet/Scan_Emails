@@ -15,7 +15,7 @@ Sur Gmail, un filtre dédié (`De : seloger` → libellé **Immo**, ignorer la b
 
 ## Fonctionnement
 1. Récupération des messages non lus de chaque boîte.
-2. Pré-classification par règles simples (expéditeur/domaine connu → dossier connu). Si aucune règle ne correspond, le message est soumis à un modèle Groq pour classification.
+2. Pré-classification par règles simples (expéditeur/domaine connu, éventuellement associé à un texte présent dans le message → dossier connu). Si aucune règle ne correspond, le message est soumis à un modèle Groq pour classification.
 3. Déplacement vers le dossier cible (ou création d'un brouillon de réponse si pertinent).
 4. Un rapport détaillé est écrit dans `workspace/last_report.md` et un résumé est envoyé sur Telegram, avec le détail **par boîte** (nombre classé, dont combien à trier, brouillons en attente).
 
@@ -59,6 +59,32 @@ Un seul fichier à modifier : `rules_orange.yaml`, dans le bloc en tête réserv
 
 `match_type` peut aussi être `domain` ou `domain_suffix` pour couvrir tout un domaine plutôt qu'une adresse précise. Aucune autre modification n'est nécessaire (ni `emails_scan.py`, ni `taxonomy_orange.yaml`) : le mécanisme est générique et s'applique à toute règle portant `action: transfer_outlook`.
 
+### Classer selon le contenu du message (`body_contains`)
+Quand un même expéditeur doit aboutir dans des dossiers différents selon une référence figurant dans le message (numéro de client, de contrat, de dossier...), on ajoute à la règle la clé optionnelle `body_contains`. Elle s'utilise dans `rules_orange.yaml` comme dans `rules_jfbconseils.yaml` : le mécanisme est commun aux 3 boîtes.
+
+```yaml
+  - match_type: sender
+    match: "adresse@exemple.com"
+    body_contains: "123456"             # texte (ou liste de textes) à trouver dans le sujet ou le corps
+    folder: "Chemin/Dossier/A"
+
+  - match_type: sender
+    match: "adresse@exemple.com"
+    body_contains: "654321"
+    folder: "Chemin/Dossier/B"
+
+  - match_type: sender                  # règle de repli : référence absente ou inconnue
+    match: "adresse@exemple.com"
+    folder: "À trier"
+```
+
+Fonctionnement :
+- La règle ne s'applique que si l'expéditeur correspond **et** que le texte cherché figure dans le sujet ou le corps. Sans `body_contains`, la règle se comporte exactement comme avant : les règles existantes ne sont pas modifiées.
+- `body_contains` accepte une chaîne ou une liste de chaînes (une seule suffit). La comparaison ignore la casse et les espaces, ce qui tolère une référence écrite avec des espaces.
+- **La première règle qui correspond l'emporte** : placer les règles à condition de contenu avant la règle générale du même expéditeur. La règle de repli vers « À trier » garantit qu'un message sans référence reconnue est relu à la main plutôt que classé au hasard (ni par défaut dans un dossier, ni par Groq).
+- La recherche porte sur le sujet et sur le **corps complet** (texte brut et HTML, balises retirées), et non sur l'extrait court transmis à Groq : un message uniquement en HTML ou dont la référence se trouve loin dans le texte est donc bien reconnu. Les pièces jointes ne sont pas lues.
+- Dans le rapport, une classification obtenue ainsi est signalée par « classé via règle + contenu → dossier » (au lieu de « classé via règle → dossier »), ce qui permet de vérifier qu'elle vient bien de la référence cherchée dans le message.
+
 ## Installation
 ```bash
 pip install openai pyyaml msal requests --break-system-packages
@@ -89,4 +115,4 @@ Le bot et le fichier de configuration (`~/.telegram_config`, section `[telegram]
 - **`recherche_immobilier.py`** — suivi des annonces immobilières (achat/location) à L'Aigle, via les alertes e-mail SeLoger lues dans le libellé Gmail **Immo** (voir ci-dessus). Projet distinct, mais qui réutilise volontairement les mêmes conventions que celui-ci : mot de passe d'application Gmail commun (`GMAIL_APP_PW`, dans le même `.secrets.env`), et même bot Telegram (`~/.telegram_config`). Aucune modification d'`emails_scan.py` n'est nécessaire pour cette coexistence.
 
 ## Auteur
-Jean-François Brunet – JFBConseils - Octobre 2026
+Jean-François Brunet – JFBConseils - Octobre 2026 (mis à jour Novembre 2026)
