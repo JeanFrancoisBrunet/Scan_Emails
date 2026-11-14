@@ -31,6 +31,13 @@ Le script applique volontairement des garde-fous stricts, issus de plusieurs inc
 - **Orange n'est jamais vidée.** Contrairement à Gmail, les messages Orange restent dans leur propre arborescence de dossiers, distincte de celle d'Outlook.
 - **Traitement résilient par message.** Une erreur sur un message (panne réseau, appel API en échec...) est journalisée dans `events.log` et n'interrompt pas le traitement des autres messages ; le message en erreur sera retenté automatiquement au run suivant.
 - **Déplacements Orange vérifiés étape par étape.** Un déplacement IMAP (`move_uid_to_folder`) enchaîne SELECT, COPY, `STORE \Deleted` puis EXPUNGE ; chacune de ces étapes est désormais vérifiée individuellement (pas seulement le COPY) — la moindre étape en échec lève une exception explicite plutôt que de laisser un message copié mais jamais retiré de la boîte de réception, sans qu'aucune erreur ne remonte nulle part. Tout déplacement Orange réussi est aussi journalisé dans `events.log` (`[orange] DÉPLACÉ (UID ..., source → cible)`), symétrique à la trace déjà existante pour Outlook, pour permettre un audit après coup en cas de comportement inattendu.
+- **Tolérance aux pannes temporaires.** Une indisponibilité passagère (service distant en panne, réseau coupé, machine tout juste sortie de veille) ne doit pas faire perdre un cycle entier. Le script :
+  1. attend au démarrage (120 s maximum) que les serveurs des 3 boîtes soient joignables ;
+  2. retente les connexions IMAP et la récupération du jeton Microsoft (3 essais) — un refus d'identifiants n'est jamais retenté ;
+  3. retente les appels Microsoft Graph avec une attente croissante (2 s, 4 s, 8 s, `Retry-After` respecté) : **les lectures** sur erreur serveur 5xx, limitation (429), délai dépassé ou coupure réseau ; **les écritures** (déplacement, import, brouillon, envoi, suppression) uniquement quand le serveur n'a manifestement pas traité la requête (429, 503, connexion jamais établie). Une écriture n'est jamais rejouée dans le doute, pour ne pas créer de doublon ;
+  4. retente la notification Telegram (3 essais).
+
+  Si la panne dépasse les essais, le comportement reste celui décrit plus haut : arrêt propre avant toute modification, message Telegram d'erreur, reprise au passage suivant (les messages non lus sont simplement repris). Chaque nouvel essai est tracé dans `events.log` (lignes `RETRY ...`, `RÉSEAU ...`), ce qui permet de distinguer une micro-panne absorbée d'une vraie panne.
 
 ## Utilisation
 ```bash
@@ -46,6 +53,8 @@ Le tout premier run doit être fait depuis un terminal interactif (SSH, Geany...
 
 ### Planification
 Le script est prévu pour tourner via cron, 3 fois par jour (3h, 11h, 19h), en complément d'un déclenchement à la demande depuis l'agent Telegram du projet.
+
+Si la machine est éteinte ou en veille à l'heure prévue, cron ne rejoue pas les passages manqués : aucun rapport ni ligne de journal n'est produit pour ce créneau. Rien n'est perdu pour autant, les messages restent non lus dans leur boîte et sont repris au passage suivant. Un lancement manuel (`python3 emails_scan.py --live`) au réveil de la machine permet de rattraper sans attendre.
 
 ### Ajouter un expéditeur à transférer vers Outlook (Orange → Outlook)
 Un seul fichier à modifier : `rules_orange.yaml`, dans le bloc en tête réservé à ces exceptions.
@@ -101,7 +110,7 @@ taxonomy_orange.yaml         arborescence de dossiers valide (Orange)
 .msal_token_cache.json       jeton OAuth2 Outlook (chmod 600, hors Git, généré au 1er lancement)
 history.json                 historique des 100 dernières actions (dédup + audit)
 workspace/last_report.md     dernier rapport détaillé, par boîte
-events.log                   erreurs et incidents
+events.log                   erreurs, incidents, déplacements et nouveaux essais (RETRY)
 ```
 
 `.secrets.env` et `.msal_token_cache.json` contiennent des identifiants et ne doivent jamais être versionnés (à ajouter au `.gitignore`).
@@ -115,4 +124,4 @@ Le bot et le fichier de configuration (`~/.telegram_config`, section `[telegram]
 - **`recherche_immobilier.py`** — suivi des annonces immobilières (achat/location) à L'Aigle, via les alertes e-mail SeLoger lues dans le libellé Gmail **Immo** (voir ci-dessus). Projet distinct, mais qui réutilise volontairement les mêmes conventions que celui-ci : mot de passe d'application Gmail commun (`GMAIL_APP_PW`, dans le même `.secrets.env`), et même bot Telegram (`~/.telegram_config`). Aucune modification d'`emails_scan.py` n'est nécessaire pour cette coexistence.
 
 ## Auteur
-Jean-François Brunet – JFBConseils - Octobre 2026 (mis à jour Novembre 2026)
+Jean-François Brunet – JFBConseils - Octobre 2026 (suite panne Microsoft du 12-13 Nov., mis à jour Novembre 2026)

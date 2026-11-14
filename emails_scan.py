@@ -32,6 +32,22 @@
 #  première règle qui correspond l'emporte : placer les règles à condition de
 #  contenu AVANT la règle générale du même expéditeur.
 #
+#  TOLÉRANCE AUX PANNES TEMPORAIRES (réseau, services distants, machine sortant de veille) —
+#  1. Au démarrage, le script attend (120 s max) que les serveurs des 3 boîtes soient
+#     joignables : utile quand la machine vient de se réveiller et que le réseau n'est
+#     pas encore remonté au moment où cron lance le script.
+#  2. Les connexions IMAP et la récupération du jeton Microsoft sont retentées (3 essais).
+#  3. Les appels Microsoft Graph sont retentés avec attente croissante (2 s, 4 s, 8 s ;
+#     l'en-tête Retry-After est respecté) :
+#       - lectures : erreurs serveur 5xx, limitation 429, délai dépassé, coupure réseau ;
+#       - écritures (déplacement, import, brouillon, envoi, suppression) : UNIQUEMENT les
+#         cas où le serveur n'a pas traité la requête (429, 503, connexion jamais établie).
+#         Une écriture n'est jamais rejouée après un doute (risque de doublon).
+#  4. La notification Telegram est retentée (3 essais).
+#  Si la panne dure au-delà des essais, le comportement reste celui d'avant : arrêt
+#  propre sans rien modifier, message Telegram d'erreur, reprise au passage suivant.
+#  Chaque nouvel essai est tracé dans events.log (lignes "RETRY ...").
+#
 #  Usage :
 #    python3 emails_scan.py                           # dry-run (par défaut)
 #    python3 emails_scan.py --live                    # actions réelles
@@ -57,7 +73,7 @@
 #    workspace/last_report.md                              dernier rapport détaillé (par boîte)
 #    events.log                                            erreurs et incidents
 #
-#  Auteur : Jean-François BRUNET – JFBConseils - Aout 2026 (mis à jour Novembre 2026)
+#  Auteur : Jean-François BRUNET – JFBConseils - Aout 2026 (mis à jour Novembre 2026 : tolérance aux pannes temporaires)
 # =============================================================================
 
 import os
@@ -66,6 +82,7 @@ import sys
 import re
 import json
 import time
+import socket
 import yaml
 import email
 import email.policy
@@ -91,6 +108,80 @@ from openai import OpenAI
 SCRIPT_DIR = Path(__file__).resolve().parent
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPES = ["Mail.ReadWrite", "Mail.Send"]  # offline_access ajouté d'office par msal
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TOLÉRANCE AUX PANNES TEMPORAIRES — paramètres et utilitaires
+# ══════════════════════════════════════════════════════════════════════════
+
+NETWORK_WAIT_MAX_S = 120        # attente maximale de la disponibilité réseau au démarrage
+NETWORK_WAIT_STEP_S = 5         # pause entre deux vérifications
+RETRY_ATTEMPTS = 3              # nombre d'essais pour connexions IMAP, jeton et Telegram
+RETRY_BASE_DELAY_S = 2.0        # attente avant le 2e essai, doublée à chaque essai suivant
+RETRY_MAX_DELAY_S = 30.0        # plafond d'une attente, Retry-After compris
+
+# Codes HTTP Graph retentés. Pour une lecture, toute erreur serveur transitoire.
+# Pour une écriture, uniquement les codes qui garantissent que la requête n'a pas
+# été traitée (limitation, service indisponible) : un 502/504 peut survenir APRÈS
+# traitement côté serveur, rejouer l'écriture risquerait un doublon.
+GRAPH_READ_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+GRAPH_WRITE_RETRY_STATUS = frozenset({429, 503})
+
+def log_event(events_log, message: str):
+    """Ajoute une ligne horodatée à events.log (sans jamais lever d'exception)."""
+    if not events_log:
+        return
+    try:
+        events_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(events_log, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {message}\n")
+    except OSError:
+        pass
+
+def retry_call(func, label: str, events_log=None, attempts: int = RETRY_ATTEMPTS,
+               base_delay: float = RETRY_BASE_DELAY_S, retry_on: tuple = (OSError,)):
+    """Exécute func() ; en cas d'exception de type retry_on, réessaie avec une
+    attente doublée à chaque essai. La dernière exception est relevée telle quelle.
+    Les erreurs d'authentification (identifiants refusés) ne doivent pas figurer
+    dans retry_on : les retenter n'a aucun intérêt."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return func()
+        except retry_on as e:
+            if attempt == attempts:
+                raise
+            delay = min(base_delay * (2 ** (attempt - 1)), RETRY_MAX_DELAY_S)
+            log_event(events_log, f"RETRY {label} (essai {attempt}/{attempts} échoué : {e}) "
+                                  f"— nouvel essai dans {delay:.0f} s")
+            time.sleep(delay)
+
+def _is_reachable(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            return True
+    except OSError:
+        return False
+
+def wait_for_network(targets: list, events_log=None, max_wait: float = NETWORK_WAIT_MAX_S,
+                     step: float = NETWORK_WAIT_STEP_S) -> bool:
+    """Attend que tous les couples (hôte, port) soient joignables. Utile quand
+    la machine vient de sortir de veille ou de démarrer et que le réseau n'est
+    pas encore remonté. Retourne True si tout est joignable, False à l'expiration
+    du délai (le script continue alors : l'erreur réelle sera journalisée par la
+    suite, avec sa cause exacte)."""
+    start = time.monotonic()
+    pending = list(targets)
+    while True:
+        pending = [(h, p) for h, p in pending if not _is_reachable(h, p)]
+        if not pending:
+            waited = time.monotonic() - start
+            if waited >= step:
+                log_event(events_log, f"RÉSEAU disponible après {waited:.0f} s d'attente")
+            return True
+        if time.monotonic() - start >= max_wait:
+            log_event(events_log, f"RÉSEAU toujours indisponible après {max_wait:.0f} s "
+                                  f"pour : {', '.join(f'{h}:{p}' for h, p in pending)}")
+            return False
+        time.sleep(step)
 
 # ══════════════════════════════════════════════════════════════════════════
 #  IMAP UTF-7 MODIFIÉ (RFC 3501) — encodage requis pour les noms de dossiers accentués. 
@@ -366,8 +457,14 @@ class ImapAccount:
         self._folder_cache = {}   # chemin "A/B/C" -> nom IMAP réel ("INBOX/A/B/C")
 
     def connect(self):
-        self.conn = imaplib.IMAP4_SSL(self.host, self.port)
-        self.conn.login(self.user, self.password)
+        # Seules les erreurs réseau (OSError : DNS, délai, coupure, SSL) sont
+        # retentées ; un refus d'identifiants (imaplib.IMAP4.error) ne l'est pas.
+        def _open():
+            conn = imaplib.IMAP4_SSL(self.host, self.port)
+            conn.login(self.user, self.password)
+            return conn
+        self.conn = retry_call(_open, label=f"[{self.name}] connexion IMAP",
+                               events_log=self._events_log)
 
     def close(self):
         if self.conn is not None:
@@ -642,7 +739,9 @@ class GraphAccount:
         accounts = self.app.get_accounts(username=self.user_hint)
         result = None
         if accounts:
-            result = self.app.acquire_token_silent(GRAPH_SCOPES, account=accounts[0])
+            result = retry_call(
+                lambda: self.app.acquire_token_silent(GRAPH_SCOPES, account=accounts[0]),
+                label=f"[{self.name}] jeton Microsoft", events_log=self._events_log)
         if not result:
             flow = self.app.initiate_device_flow(scopes=GRAPH_SCOPES)
             if "user_code" not in flow:
@@ -666,21 +765,63 @@ class GraphAccount:
             h.update(extra)
         return h
 
+    def _request(self, method: str, path: str, idempotent: bool, retries: int = RETRY_ATTEMPTS, **kwargs):
+        """Requête Graph avec nouvel essai sur panne temporaire.
+        idempotent=True (lecture, ou écriture sans effet cumulatif) : retentée sur
+        GRAPH_READ_RETRY_STATUS, délai dépassé et coupure réseau.
+        idempotent=False (création, déplacement, envoi, suppression) : retentée
+        UNIQUEMENT sur GRAPH_WRITE_RETRY_STATUS ou si la connexion n'a jamais été
+        établie — jamais après un doute sur le traitement côté serveur.
+        Les erreurs 4xx (hors 429) ne sont jamais retentées : elles signalent un
+        vrai problème. Après le dernier essai, l'erreur d'origine est relevée
+        (HTTPError ou exception réseau), comme avant l'introduction des essais."""
+        url = f"{GRAPH_BASE}{path}"
+        retry_status = GRAPH_READ_RETRY_STATUS if idempotent else GRAPH_WRITE_RETRY_STATUS
+        for attempt in range(retries + 1):
+            wait = None
+            try:
+                r = requests.request(method, url, timeout=30, **kwargs)
+            except requests.ConnectTimeout as e:
+                # Connexion jamais établie : rien n'a été envoyé, sûr même pour une écriture.
+                err, reason = e, "connexion impossible"
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if not idempotent:
+                    raise
+                err, reason = e, "coupure ou délai dépassé"
+            else:
+                if r.status_code not in retry_status:
+                    r.raise_for_status()
+                    return r
+                err, reason = None, f"HTTP {r.status_code}"
+                try:
+                    wait = float(r.headers.get("Retry-After", ""))
+                except ValueError:
+                    wait = None
+            if attempt == retries:
+                if err is not None:
+                    raise err
+                r.raise_for_status()
+                return r
+            delay = min(wait if wait is not None else RETRY_BASE_DELAY_S * (2 ** attempt), RETRY_MAX_DELAY_S)
+            log_event(self._events_log,
+                      f"RETRY [{self.name}] {method} {path[:40]} ({reason}, essai {attempt + 1}/{retries + 1}) "
+                      f"— nouvel essai dans {delay:.0f} s")
+            time.sleep(delay)
+
     def _get(self, path: str, params: dict = None, extra_headers: dict = None) -> dict:
-        r = requests.get(f"{GRAPH_BASE}{path}", headers=self._headers(extra_headers), params=params, timeout=30)
-        r.raise_for_status()
+        r = self._request("GET", path, idempotent=True,
+                          headers=self._headers(extra_headers), params=params)
         return r.json()
 
     def _post(self, path: str, json_body: dict = None, data=None, extra_headers: dict = None) -> dict:
-        headers = self._headers(extra_headers)
-        r = requests.post(f"{GRAPH_BASE}{path}", headers=headers, json=json_body, data=data, timeout=30)
-        r.raise_for_status()
+        r = self._request("POST", path, idempotent=False,
+                          headers=self._headers(extra_headers), json=json_body, data=data)
         return r.json() if r.text else {}
 
     def _patch(self, path: str, json_body: dict) -> dict:
-        r = requests.patch(f"{GRAPH_BASE}{path}", headers=self._headers({"Content-Type": "application/json"}),
-                            json=json_body, timeout=30)
-        r.raise_for_status()
+        # Remplacer des champs par les mêmes valeurs est sans effet cumulatif : retentable.
+        r = self._request("PATCH", path, idempotent=True,
+                          headers=self._headers({"Content-Type": "application/json"}), json=json_body)
         return r.json() if r.text else {}
 
     def fetch_unseen(self, folder: str = "inbox") -> list:
@@ -763,8 +904,8 @@ class GraphAccount:
         return moved.get("id", message_id)
 
     def delete_message(self, message_id: str):
-        r = requests.delete(f"{GRAPH_BASE}/me/messages/{message_id}", headers=self._headers(), timeout=30)
-        r.raise_for_status()
+        self._request("DELETE", f"/me/messages/{message_id}", idempotent=False,
+                      headers=self._headers())
 
     def import_mime(self, raw_bytes: bytes, target_path: str):
         """Importe un message brut RFC822 (ex. venant de Gmail) directement
@@ -1008,10 +1149,17 @@ def send_telegram(token: str, chat_id: str, text: str):
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
-    try:
-        urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10)
-    except Exception as e:
-        print(f"⚠ Notification Telegram échouée : {e}", file=sys.stderr)
+    # Trois essais : une notification perdue ne doit pas passer inaperçue, et une
+    # notification en double (si la réponse s'est perdue après envoi) est sans conséquence.
+    for attempt in range(1, 4):
+        try:
+            urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=15)
+            return
+        except Exception as e:
+            if attempt == 3:
+                print(f"⚠ Notification Telegram échouée : {e}", file=sys.stderr)
+            else:
+                time.sleep(3 * attempt)
 
 # ══════════════════════════════════════════════════════════════════════════
 #  TRAITEMENT PRINCIPAL
@@ -1336,13 +1484,21 @@ def main():
     self_addresses = {gmail_cfg["user"].lower(), orange_cfg["user"].lower(), graph_cfg["user"].lower()}
 
     gmail = ImapAccount("gmail", gmail_cfg["host"], gmail_cfg["port"],
-                        gmail_cfg["user"], os.environ["GMAIL_APP_PW"])
+                        gmail_cfg["user"], os.environ["GMAIL_APP_PW"], events_log=events_log)
     orange = ImapAccount("orange", orange_cfg["host"], orange_cfg["port"],
                           orange_cfg["user"], os.environ["ORANGE_APP_PW"], events_log=events_log)
     outlook = GraphAccount("outlook", graph_cfg["client_id"], graph_cfg["user"],
                             expand(graph_cfg["token_cache_path"]), events_log=events_log)
 
     try:
+        # Attend que le réseau soit remonté (machine sortant de veille, démarrage...)
+        # avant toute connexion : évite un échec immédiat sur une résolution DNS ou une
+        # connexion impossible. Ne bloque pas plus de NETWORK_WAIT_MAX_S secondes.
+        wait_for_network([("graph.microsoft.com", 443),
+                          (gmail_cfg["host"], gmail_cfg["port"]),
+                          (orange_cfg["host"], orange_cfg["port"])],
+                         events_log=events_log)
+
         outlook.connect()
         gmail.connect()
         orange.connect()
